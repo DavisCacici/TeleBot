@@ -1,17 +1,87 @@
 const http = require('http');
 const path = require('path');
-const { getChats, PROJECTS_DIR } = require('./projects');
+const crypto = require('crypto');
+const { getChats, getProjectByConversation, PROJECTS_DIR } = require('./projects');
 const { saveLog } = require('./db');
 const {
   recordSessionStart,
   recordSessionTool,
-  recordSessionStop
+  recordSessionStop,
+  getSession
 } = require('./sessions');
 
 const PORT = parseInt(process.env.HOOK_PORT || '37482', 10);
 
-// Mappa delle conferme in attesa: requestId -> { res, timer, projectName, toolName, sentMessages }
+// Mappa delle conferme in attesa: requestId -> { res, timer, projectName, toolName, sentMessages, extraResponses }
 const pendingRequests = new Map();
+
+// Cache delle attività già notificate (activityId -> timestamp) per evitare avvisi multipli
+const notifiedActivities = new Map();
+
+// Cache delle richieste di conferma già gestite (requestId -> { decision, timestamp })
+const handledConfirmationRequests = new Map();
+
+function cleanCaches() {
+  const now = Date.now();
+  if (notifiedActivities.size > 200) {
+    for (const [id, ts] of notifiedActivities.entries()) {
+      if (now - ts > 12 * 60 * 60 * 1000) notifiedActivities.delete(id);
+    }
+  }
+  if (handledConfirmationRequests.size > 200) {
+    for (const [id, item] of handledConfirmationRequests.entries()) {
+      if (now - item.timestamp > 15 * 60 * 1000) handledConfirmationRequests.delete(id);
+    }
+  }
+}
+
+function getOrCreateActivity(convId) {
+  const session = getSession(convId);
+  const now = Date.now();
+
+  // Se esiste una sessione attiva già in esecuzione e l'ultima attività è recente (< 3 minuti),
+  // significa che siamo in uno step intermedio dello stesso prompt/attività in corso
+  const isRunning = session && session.status === 'RUNNING' && session.activityId;
+  const isRecent = session && session.lastActivity && (now - new Date(session.lastActivity).getTime() < 3 * 60 * 1000);
+
+  if (isRunning && isRecent) {
+    return {
+      activityId: session.activityId,
+      isNewActivity: false
+    };
+  }
+
+  // Altrimenti è l'avvio di una nuova attività (primo prompt o prompt successivo dopo Stop)
+  const shortId = Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6);
+  const newActivityId = `act_${(convId || 'global').slice(0, 8)}_${shortId}`;
+
+  return {
+    activityId: newActivityId,
+    isNewActivity: true
+  };
+}
+
+function getConfirmationRequestId(payload) {
+  const toolCall = payload.toolCall || {};
+  const toolName = toolCall.name || 'unknown';
+  const toolArgs = toolCall.args ? JSON.stringify(toolCall.args) : '';
+  const convId = payload.conversationId || '';
+  const stepIdx = payload.stepIdx !== undefined ? payload.stepIdx : '';
+
+  // Se l'agente fornisce un callId univoco
+  if (toolCall.id || payload.toolCallId || payload.callId) {
+    const rawId = toolCall.id || payload.toolCallId || payload.callId;
+    return `req_${String(rawId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 24)}`;
+  }
+
+  // Altrimenti genera un hash deterministico dei parametri del tool e dello step
+  const hash = crypto.createHash('sha256')
+    .update(`${convId}:${stepIdx}:${toolName}:${toolArgs}`)
+    .digest('hex')
+    .slice(0, 10);
+
+  return `req_${toolName}_${hash}`;
+}
 
 // Riferimento al bot telegram passato all'avvio
 let telegramBot = null;
@@ -20,11 +90,30 @@ function setBotInstance(bot) {
   telegramBot = bot;
 }
 
-function getProjectFromWorkspaces(workspacePaths) {
-  if (!workspacePaths || !workspacePaths.length) return 'Antigravity Workspace';
-  const firstPath = workspacePaths[0];
-  const basename = path.basename(firstPath);
-  return basename || firstPath;
+function getProjectFromWorkspaces(workspacePaths, payload = null) {
+  if (workspacePaths && workspacePaths.length && workspacePaths[0]) {
+    const b = path.basename(workspacePaths[0]);
+    if (b) return b;
+  }
+  if (payload) {
+    if (payload.conversationId) {
+      try {
+        const p = getProjectByConversation(payload.conversationId);
+        if (p) return p;
+      } catch (e) {}
+    }
+    const single = payload.workspacePath || payload.cwd || payload.toolCall?.args?.Cwd;
+    if (single) {
+      const b = path.basename(single.replace(/\\+$/, ''));
+      if (b) return b;
+    }
+    const fileArg = payload.toolCall?.args?.TargetFile || payload.toolCall?.args?.AbsolutePath;
+    if (fileArg) {
+      const m = fileArg.match(/_SORGENTI[\/\\]+([^\/\\]+)/i);
+      if (m && m[1]) return m[1];
+    }
+  }
+  return 'Antigravity Workspace';
 }
 
 function isActionTool(toolName) {
@@ -121,7 +210,7 @@ function startHookServer() {
       }
 
       const workspacePaths = payload?.workspacePaths || [];
-      const projectName = getProjectFromWorkspaces(workspacePaths);
+      const projectName = getProjectFromWorkspaces(workspacePaths, payload);
 
       saveLog({
         level: 'INFO',
@@ -163,14 +252,19 @@ async function handlePreInvocation(payload, res, fromTelegram = false) {
   res.writeHead(200, { 'Content-Type': 'application/json' });
   res.end('{}');
 
+  cleanCaches();
+
   const conversationId = payload.conversationId;
   const workspacePaths = payload.workspacePaths || [];
-  const projectName = getProjectFromWorkspaces(workspacePaths);
+  const projectName = getProjectFromWorkspaces(workspacePaths, payload);
   const modelName = payload.modelName || 'auto';
 
-  // Registra la sessione tra quelle attive
+  const { activityId, isNewActivity } = getOrCreateActivity(conversationId);
+
+  // Registra la sessione tra quelle attive (o aggiorna lastActivity se già in corso)
   recordSessionStart({
     conversationId,
+    activityId,
     projectName,
     workspacePaths,
     modelName,
@@ -180,14 +274,26 @@ async function handlePreInvocation(payload, res, fromTelegram = false) {
   // Se il prompt è stato lanciato direttamente da Telegram, index.js invia già "🚀 Esecuzione avviata"
   if (fromTelegram) return;
 
+  // Invia la notifica di avvio SOLO per la nuova attività (non per i sotto-step del prompt)
+  if (!isNewActivity) {
+    return;
+  }
+
+  // Evita doppie notifiche anche in caso di hook concorrenti simultanei
+  if (notifiedActivities.has(activityId)) {
+    return;
+  }
+  notifiedActivities.set(activityId, Date.now());
+
   const chats = getChats();
   if (!telegramBot || chats.length === 0) return;
 
   const text =
     `🚀 <b>Nuova attività avviata</b>\n` +
+    `🆔 <b>ID Attività:</b> <code>${escapeHtml(activityId)}</code>\n` +
     `📁 <b>Progetto:</b> <code>${escapeHtml(projectName)}</code>\n` +
     `🤖 <b>Modello:</b> <code>${escapeHtml(modelName)}</code>\n` +
-    `🆔 <b>Sessione:</b> <code>${escapeHtml(conversationId || 'N/A')}</code>`;
+    `💬 <b>Sessione:</b> <code>${escapeHtml(conversationId || 'N/A')}</code>`;
 
   for (const chatId of chats) {
     try {
@@ -202,8 +308,10 @@ async function handlePreToolUse(payload, res) {
   const toolCall = payload.toolCall || {};
   const toolName = toolCall.name || 'unknown';
   const workspacePaths = payload.workspacePaths || [];
-  const projectName = getProjectFromWorkspaces(workspacePaths);
+  const projectName = getProjectFromWorkspaces(workspacePaths, payload);
   const conversationId = payload.conversationId;
+
+  cleanCaches();
 
   // Registra il tool in esecuzione per la sessione
   recordSessionTool(conversationId, toolName, toolCall.args);
@@ -220,28 +328,57 @@ async function handlePreToolUse(payload, res) {
     return res.end(JSON.stringify({ decision: 'allow' }));
   }
 
-  const requestId = 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+  const requestId = getConfirmationRequestId(payload);
+
+  // ID univoco: se la richiesta è già stata elaborata in precedenza, rispondi con la stessa decisione senza reinviare
+  if (handledConfirmationRequests.has(requestId)) {
+    const prev = handledConfirmationRequests.get(requestId);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ decision: prev.decision || 'allow' }));
+  }
+
+  // Se la stessa richiesta è già attualmente in attesa (es. chiamata simultanea da hook multipli),
+  // accoda la risposta HTTP senza reinviare un duplicato a Telegram
+  if (pendingRequests.has(requestId)) {
+    const pending = pendingRequests.get(requestId);
+    if (pending && pending.res !== res) {
+      pending.extraResponses = pending.extraResponses || [];
+      pending.extraResponses.push(res);
+    }
+    return;
+  }
+
   const sentMessages = [];
 
   // TIMEOUT A 60 SECONDI (1 MINUTO): Se l'utente non preme nulla, accetta di DEFAULT
   const timer = setTimeout(async () => {
     if (pendingRequests.has(requestId)) {
+      const pending = pendingRequests.get(requestId);
       pendingRequests.delete(requestId);
+      handledConfirmationRequests.set(requestId, { decision: 'allow', timestamp: Date.now() });
 
       saveLog({
         level: 'INFO',
         eventType: 'permission_auto_approved',
         projectName,
         conversationId,
-        message: `Auto-approvato per timeout (60s) il tool ${toolName}`,
+        message: `Auto-approvato per timeout (60s) il tool ${toolName} (ID: ${requestId})`,
         payload: { requestId, toolName, toolCall }
       }).catch(() => {});
 
       try {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        // ACCETTAZIONE DI DEFAULT DOPO 1 MINUTO
         res.end(JSON.stringify({ decision: 'allow' }));
       } catch (e) {}
+
+      if (pending && pending.extraResponses && pending.extraResponses.length) {
+        for (const r of pending.extraResponses) {
+          try {
+            r.writeHead(200, { 'Content-Type': 'application/json' });
+            r.end(JSON.stringify({ decision: 'allow' }));
+          } catch (e) {}
+        }
+      }
 
       // Aggiorna i messaggi su Telegram
       for (const sent of sentMessages) {
@@ -258,10 +395,11 @@ async function handlePreToolUse(payload, res) {
     }
   }, 60000);
 
-  pendingRequests.set(requestId, { res, timer, projectName, toolName, sentMessages });
+  pendingRequests.set(requestId, { res, timer, projectName, toolName, sentMessages, extraResponses: [] });
 
   const messageText = 
     `⚠️ <b>Richiesta di conferma</b>\n` +
+    `🆔 <b>ID Richiesta:</b> <code>${escapeHtml(requestId)}</code>\n` +
     `📁 <b>Progetto:</b> <code>${escapeHtml(projectName)}</code>\n` +
     `🔧 <b>Tool:</b> <code>${escapeHtml(toolName)}</code>\n\n` +
     `${formatToolDetails(toolCall)}\n\n` +
@@ -299,9 +437,12 @@ async function handleStop(payload, res, fromTelegram = false) {
 
   const conversationId = payload.conversationId;
   const workspacePaths = payload.workspacePaths || [];
-  const projectName = getProjectFromWorkspaces(workspacePaths);
+  const projectName = getProjectFromWorkspaces(workspacePaths, payload);
   const terminationReason = payload.terminationReason || 'completato';
   const error = payload.error;
+
+  const session = getSession(conversationId);
+  const activityId = session?.activityId || null;
 
   // Aggiorna lo stato della sessione a completata
   recordSessionStop(conversationId, { terminationReason, error });
@@ -313,17 +454,21 @@ async function handleStop(payload, res, fromTelegram = false) {
   if (!telegramBot || chats.length === 0) return;
 
   let messageText = '';
+  const actInfo = activityId ? `🆔 <b>ID Attività:</b> <code>${escapeHtml(activityId)}</code>\n` : '';
+
   if (error) {
     messageText = 
       `❌ <b>Attività interrotta con errore</b>\n` +
+      `${actInfo}` +
       `📁 <b>Progetto:</b> <code>${escapeHtml(projectName)}</code>\n` +
-      `🆔 <b>Sessione:</b> <code>${escapeHtml(conversationId || 'N/A')}</code>\n` +
+      `💬 <b>Sessione:</b> <code>${escapeHtml(conversationId || 'N/A')}</code>\n` +
       `⚠️ <b>Errore:</b> <code>${escapeHtml(error)}</code>`;
   } else {
     messageText = 
-      `🏁 <b>Sessione completata!</b>\n` +
+      `🏁 <b>Attività completata!</b>\n` +
+      `${actInfo}` +
       `📁 <b>Progetto:</b> <code>${escapeHtml(projectName)}</code>\n` +
-      `🆔 <b>Sessione:</b> <code>${escapeHtml(conversationId || 'N/A')}</code>\n` +
+      `💬 <b>Sessione:</b> <code>${escapeHtml(conversationId || 'N/A')}</code>\n` +
       `✨ <b>Stato:</b> L'agente ha terminato l'attività (<code>${escapeHtml(terminationReason)}</code>).`;
   }
 
@@ -343,22 +488,30 @@ function resolvePendingRequest(requestId, decision) {
   const pending = pendingRequests.get(requestId);
   clearTimeout(pending.timer);
   pendingRequests.delete(requestId);
+  handledConfirmationRequests.set(requestId, { decision, timestamp: Date.now() });
+
+  const responseBody = decision === 'allow'
+    ? JSON.stringify({ decision: 'allow' })
+    : JSON.stringify({ decision: 'deny', reason: 'Operazione rifiutata dall\'utente su Telegram' });
 
   try {
     pending.res.writeHead(200, { 'Content-Type': 'application/json' });
-    if (decision === 'allow') {
-      pending.res.end(JSON.stringify({ decision: 'allow' }));
-    } else {
-      pending.res.end(JSON.stringify({
-        decision: 'deny',
-        reason: 'Operazione rifiutata dall\'utente su Telegram'
-      }));
-    }
-    return true;
+    pending.res.end(responseBody);
   } catch (err) {
-    console.error('Errore durante la risoluzione della richiesta:', err);
-    return false;
+    console.error('Errore durante la risoluzione della richiesta principale:', err);
   }
+
+  // Risponde anche a eventuali richieste duplicate pendenti agganciate
+  if (pending.extraResponses && pending.extraResponses.length) {
+    for (const r of pending.extraResponses) {
+      try {
+        r.writeHead(200, { 'Content-Type': 'application/json' });
+        r.end(responseBody);
+      } catch (e) {}
+    }
+  }
+
+  return true;
 }
 
 module.exports = {

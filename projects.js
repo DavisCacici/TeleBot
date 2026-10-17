@@ -97,16 +97,56 @@ function listProjects() {
   }
 }
 
-function hasGlobalTelegramHook() {
+function ensureGlobalTelegramHook() {
   try {
     const os = require('os');
-    const globalHookFile = path.join(os.homedir(), '.gemini', 'config', 'hooks.json');
-    if (fs.existsSync(globalHookFile)) {
-      const globalConfig = JSON.parse(fs.readFileSync(globalHookFile, 'utf8').replace(/^\uFEFF/, ''));
-      return Boolean(globalConfig && globalConfig['telegram-bot']);
+    const globalConfigDir = path.join(os.homedir(), '.gemini', 'config');
+    const globalHookFile = path.join(globalConfigDir, 'hooks.json');
+
+    if (!fs.existsSync(globalConfigDir)) {
+      fs.mkdirSync(globalConfigDir, { recursive: true });
     }
-  } catch (e) {}
-  return false;
+
+    let globalConfig = {};
+    if (fs.existsSync(globalHookFile)) {
+      try {
+        globalConfig = JSON.parse(fs.readFileSync(globalHookFile, 'utf8').replace(/^\uFEFF/, ''));
+      } catch (e) {}
+    }
+
+    globalConfig['telegram-bot'] = {
+      "PreInvocation": [
+        {
+          "type": "command",
+          "command": "node C:\\_SORGENTI\\TeleBot\\hook.js PreInvocation",
+          "timeout": 15
+        }
+      ],
+      "PreToolUse": [
+        {
+          "matcher": "*",
+          "hooks": [
+            {
+              "type": "command",
+              "command": "node C:\\_SORGENTI\\TeleBot\\hook.js PreToolUse",
+              "timeout": 75
+            }
+          ]
+        }
+      ],
+      "Stop": [
+        {
+          "type": "command",
+          "command": "node C:\\_SORGENTI\\TeleBot\\hook.js Stop",
+          "timeout": 15
+        }
+      ]
+    };
+
+    fs.writeFileSync(globalHookFile, JSON.stringify(globalConfig, null, 2), 'utf8');
+  } catch (err) {
+    console.error('Errore durante la configurazione dell\'hook globale:', err);
+  }
 }
 
 function ensureProjectHook(projectPath) {
@@ -115,34 +155,24 @@ function ensureProjectHook(projectPath) {
     const agentsDir = path.join(projectPath, '.agents');
     const hookFile = path.join(agentsDir, 'hooks.json');
 
-    // Se l'hook è già configurato globalmente in ~/.gemini/config/hooks.json,
-    // rimuoviamo eventuale copia locale per evitare doppie esecuzioni e doppie notifiche!
-    if (hasGlobalTelegramHook()) {
-      if (fs.existsSync(hookFile)) {
-        try {
-          const existing = JSON.parse(fs.readFileSync(hookFile, 'utf8').replace(/^\uFEFF/, ''));
-          if (existing && existing['telegram-bot']) {
-            delete existing['telegram-bot'];
-            if (Object.keys(existing).length === 0) {
-              fs.unlinkSync(hookFile);
-            } else {
-              fs.writeFileSync(hookFile, JSON.stringify(existing, null, 2), 'utf8');
-            }
-          }
-        } catch (e) {}
-      }
-      return;
-    }
-
     if (!fs.existsSync(agentsDir)) {
       fs.mkdirSync(agentsDir, { recursive: true });
     }
+
+    let existing = {};
+    if (fs.existsSync(hookFile)) {
+      try {
+        existing = JSON.parse(fs.readFileSync(hookFile, 'utf8').replace(/^\uFEFF/, ''));
+      } catch (e) {}
+    }
+
     const hookConfig = {
+      ...existing,
       "telegram-bot": {
         "PreInvocation": [
           {
             "type": "command",
-            "command": "node C:\\_SORGENTI\\telegraf\\hook.js PreInvocation",
+            "command": "node C:\\_SORGENTI\\TeleBot\\hook.js PreInvocation",
             "timeout": 15
           }
         ],
@@ -152,7 +182,7 @@ function ensureProjectHook(projectPath) {
             "hooks": [
               {
                 "type": "command",
-                "command": "node C:\\_SORGENTI\\telegraf\\hook.js PreToolUse",
+                "command": "node C:\\_SORGENTI\\TeleBot\\hook.js PreToolUse",
                 "timeout": 75
               }
             ]
@@ -161,7 +191,7 @@ function ensureProjectHook(projectPath) {
         "Stop": [
           {
             "type": "command",
-            "command": "node C:\\_SORGENTI\\telegraf\\hook.js Stop",
+            "command": "node C:\\_SORGENTI\\TeleBot\\hook.js Stop",
             "timeout": 15
           }
         ]
@@ -173,12 +203,11 @@ function ensureProjectHook(projectPath) {
   }
 }
 
-// Pulisce subito eventuali hook duplicati nei progetti se esiste già l'hook globale
+// Configura hook sia a livello globale che nei progetti noti
 try {
-  if (hasGlobalTelegramHook()) {
-    for (const p of listProjects()) {
-      ensureProjectHook(p.path);
-    }
+  ensureGlobalTelegramHook();
+  for (const p of listProjects()) {
+    ensureProjectHook(p.path);
   }
 } catch (e) {}
 
@@ -225,6 +254,14 @@ function clearConversation(projectName) {
   });
 }
 
+function getProjectByConversation(conversationId) {
+  if (!conversationId || !state.conversationsByProject) return null;
+  for (const [projectName, convId] of Object.entries(state.conversationsByProject)) {
+    if (convId === conversationId) return projectName;
+  }
+  return null;
+}
+
 function getSelectedModel(chatId) {
   if (state.modelByChat && state.modelByChat[chatId]) {
     return state.modelByChat[chatId];
@@ -250,6 +287,61 @@ function setSelectedModel(chatId, modelId) {
   });
 }
 
+function getVoiceSettings(chatId) {
+  const globalVoice = state.settings?.voice || {};
+  const chatVoice = state.voiceByChat?.[chatId] || {};
+  return {
+    ttsEnabled: chatVoice.ttsEnabled !== undefined ? chatVoice.ttsEnabled : (globalVoice.ttsEnabled || false),
+    autoRun: chatVoice.autoRun !== undefined ? chatVoice.autoRun : (globalVoice.autoRun !== undefined ? globalVoice.autoRun : true),
+    apiKey: chatVoice.apiKey || globalVoice.apiKey || process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || null,
+    provider: chatVoice.provider || globalVoice.provider || 'auto'
+  };
+}
+
+function setVoiceSettings(chatId, newSettings) {
+  if (!state.voiceByChat) state.voiceByChat = {};
+  if (!state.settings) state.settings = {};
+  if (!state.settings.voice) state.settings.voice = {};
+
+  const current = getVoiceSettings(chatId);
+  const updated = { ...current, ...newSettings };
+
+  state.voiceByChat[chatId] = updated;
+
+  // Se viene salvata una chiave globale/per chat
+  if (newSettings.apiKey) {
+    state.settings.voice.apiKey = newSettings.apiKey;
+  }
+  if (newSettings.provider) {
+    state.settings.voice.provider = newSettings.provider;
+  }
+
+  saveState('voice_settings_changed', {
+    chatId,
+    message: `Impostazioni vocali aggiornate per chat ${chatId}`
+  });
+
+  return updated;
+}
+
+function setRestartNotifyChat(chatId) {
+  state.restartNotifyChat = chatId;
+  saveState('restart_requested', {
+    chatId,
+    message: 'Richiesta di riavvio inviata da Telegram'
+  });
+}
+
+function popRestartNotifyChat() {
+  const chatId = state.restartNotifyChat;
+  if (chatId) {
+    delete state.restartNotifyChat;
+    saveStateToDb(state);
+    return chatId;
+  }
+  return null;
+}
+
 module.exports = {
   PROJECTS_DIR,
   initState,
@@ -260,8 +352,13 @@ module.exports = {
   setActiveProject,
   getActiveProject,
   getConversation,
+  getProjectByConversation,
   setConversation,
   clearConversation,
   getSelectedModel,
-  setSelectedModel
+  setSelectedModel,
+  getVoiceSettings,
+  setVoiceSettings,
+  setRestartNotifyChat,
+  popRestartNotifyChat
 };

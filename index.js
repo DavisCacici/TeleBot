@@ -9,9 +9,16 @@ const {
   getActiveProject,
   getConversation,
   setConversation,
-  clearConversation
+  clearConversation,
+  getSelectedModel,
+  setSelectedModel
 } = require('./projects');
-const { runAgentPrompt, cancelRunningProcess } = require('./agent');
+const {
+  runAgentPrompt,
+  cancelRunningProcess,
+  getAvailableModels,
+  getModelLabel
+} = require('./agent');
 const { startHookServer, setBotInstance, resolvePendingRequest } = require('./server');
 const { saveLog } = require('./db');
 const { getActiveSessions, scanAllSessions } = require('./sessions');
@@ -47,6 +54,42 @@ function escapeHtml(text) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;');
+}
+
+// Helper per generare la tastiera dei modelli disponibili
+function getModelsKeyboard(currentModel = null) {
+  const models = getAvailableModels();
+  const inline_keyboard = [];
+
+  const isDefault = !currentModel || currentModel === 'default';
+  inline_keyboard.push([
+    {
+      text: `${isDefault ? '✅ ' : '⚙️ '}Predefinito (Auto)`,
+      callback_data: 'sel_model:default'
+    }
+  ]);
+
+  for (let i = 0; i < models.length; i += 2) {
+    const row = [];
+    const m1 = models[i];
+    const isSel1 = currentModel === m1.id;
+    row.push({
+      text: `${isSel1 ? '✅ ' : '🤖 '}${m1.label}`,
+      callback_data: `sel_model:${m1.id}`
+    });
+
+    if (i + 1 < models.length) {
+      const m2 = models[i + 1];
+      const isSel2 = currentModel === m2.id;
+      row.push({
+        text: `${isSel2 ? '✅ ' : '🤖 '}${m2.label}`,
+        callback_data: `sel_model:${m2.id}`
+      });
+    }
+    inline_keyboard.push(row);
+  }
+
+  return inline_keyboard;
 }
 
 // Helper per generare la tastiera dei progetti con paginazione
@@ -136,15 +179,18 @@ bot.start((ctx) => {
   registerChat(chatId);
 
   const active = getActiveProject(chatId);
+  const currentModel = getSelectedModel(chatId);
   const activeText = active ? `\n📌 <b>Progetto attivo:</b> <code>${active.name}</code>` : '';
+  const modelText = `\n🤖 <b>Modello attivo:</b> <code>${escapeHtml(getModelLabel(currentModel))}</code>`;
 
   ctx.reply(
     `👋 <b>Benvenuto nel Bot Antigravity!</b>\n` +
-    `Questo bot ti permette di gestire i tuoi progetti e sessioni di sviluppo da remoto.${activeText}\n\n` +
+    `Questo bot ti permette di gestire i tuoi progetti e sessioni di sviluppo da remoto.${activeText}${modelText}\n\n` +
     `<b>Comandi principali:</b>\n` +
     `• /progetti - Mostra e seleziona un progetto da <code>${PROJECTS_DIR}</code>\n` +
+    `• /model - Cambia il modello AI usato dall'agente\n` +
     `• /sessioni - Mostra tutte le sessioni attive e recenti (IDE & CLI compresi)\n` +
-    `• /stato - Dettagli sul progetto attivo e la sessione\n` +
+    `• /stato - Dettagli sul progetto attivo, modello e sessione\n` +
     `• /nuova - Avvia una nuova sessione (resetta la cronologia per il progetto)\n` +
     `• /stop - Annulla l'esecuzione in corso\n` +
     `• /help - Mostra l'elenco dei comandi disponibili\n\n` +
@@ -159,15 +205,18 @@ bot.command(['help', 'aiuto'], (ctx) => {
   registerChat(chatId);
 
   const active = getActiveProject(chatId);
-  const activeText = active ? `\n📌 <b>Progetto attivo:</b> <code>${active.name}</code>\n` : '';
+  const currentModel = getSelectedModel(chatId);
+  const activeText = active ? `\n📌 <b>Progetto attivo:</b> <code>${active.name}</code>` : '';
+  const modelText = `\n🤖 <b>Modello attivo:</b> <code>${escapeHtml(getModelLabel(currentModel))}</code>\n`;
 
   ctx.reply(
-    `📖 <b>Guida ai Comandi - Bot Antigravity</b>\n${activeText}\n` +
+    `📖 <b>Guida ai Comandi - Bot Antigravity</b>${activeText}${modelText}\n` +
     `<b>Comandi principali:</b>\n` +
     `• /start - Messaggio di benvenuto e panoramica iniziale\n` +
     `• /progetti (o /projects) - Sfoglia e seleziona un progetto da <code>${PROJECTS_DIR}</code>\n` +
+    `• /model (o /modello) - Scegli il modello AI (es. Gemini 4 Argon, Gemini 3.8 Flash, Claude 5.5)\n` +
     `• /sessioni (o /sessions) - Visualizza le sessioni attive e recenti (IDE, CLI e Telegram)\n` +
-    `• /stato (o /status) - Mostra informazioni sul progetto attivo e l'ID della conversazione\n` +
+    `• /stato (o /status) - Mostra informazioni sul progetto attivo, modello e conversazione\n` +
     `• /nuova (o /new) - Resetta la sessione corrente per iniziare una nuova conversazione\n` +
     `• /stop (o /annulla) - Interrompe l'esecuzione dell'agente attualmente in corso\n` +
     `• /help (o /aiuto) - Mostra questo elenco di comandi\n\n` +
@@ -262,14 +311,73 @@ bot.action('noop', (ctx) => {
   ctx.answerCbQuery().catch(() => {});
 });
 
+// Comando /model o /modello o /models
+bot.command(['model', 'modello', 'models'], (ctx) => {
+  const chatId = ctx.chat.id;
+  registerChat(chatId);
+
+  const parts = (ctx.message.text || '').trim().split(/\s+/);
+  const argModel = parts[1] ? parts[1].trim() : null;
+
+  if (argModel) {
+    setSelectedModel(chatId, argModel);
+    const label = getModelLabel(argModel);
+    return ctx.reply(
+      `✅ <b>Modello aggiornato:</b> <code>${escapeHtml(label)}</code> (<code>${escapeHtml(argModel)}</code>)`,
+      { parse_mode: 'HTML' }
+    );
+  }
+
+  const currentModel = getSelectedModel(chatId);
+  const keyboard = getModelsKeyboard(currentModel);
+
+  ctx.reply(
+    `🤖 <b>Seleziona il modello AI per Antigravity:</b>\n\n` +
+    `Modello attuale: <b>${escapeHtml(getModelLabel(currentModel))}</b>${currentModel ? ` (<code>${escapeHtml(currentModel)}</code>)` : ''}\n\n` +
+    `Scegli un modello dai pulsanti qui sotto (oppure usa <code>/model nome-modello</code>):`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: keyboard }
+    }
+  );
+});
+
+// Callback selezione modello dalla tastiera inline
+bot.action(/^sel_model:(.+)$/, (ctx) => {
+  const modelId = ctx.match[1];
+  const chatId = ctx.chat.id;
+
+  setSelectedModel(chatId, modelId);
+  const currentModel = getSelectedModel(chatId);
+  const label = getModelLabel(currentModel);
+  const keyboard = getModelsKeyboard(currentModel);
+
+  ctx.answerCbQuery(`Modello impostato: ${label}`).catch(() => {});
+
+  ctx.editMessageText(
+    `🤖 <b>Seleziona il modello AI per Antigravity:</b>\n\n` +
+    `✅ Modello selezionato: <b>${escapeHtml(label)}</b>${currentModel ? ` (<code>${escapeHtml(currentModel)}</code>)` : ''}\n\n` +
+    `Scegli un modello dai pulsanti qui sotto (oppure usa <code>/model nome-modello</code>):`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: keyboard }
+    }
+  ).catch(() => {});
+});
+
 // Comando /stato
 bot.command(['stato', 'status'], (ctx) => {
   const chatId = ctx.chat.id;
   registerChat(chatId);
   const active = getActiveProject(chatId);
+  const currentModel = getSelectedModel(chatId);
 
   if (!active) {
-    return ctx.reply('⚠️ Nessun progetto attualmente selezionato. Usa /progetti per sceglierne uno.');
+    return ctx.reply(
+      `⚠️ Nessun progetto attualmente selezionato. Usa /progetti per sceglierne uno.\n` +
+      `🤖 <b>Modello attivo:</b> <code>${escapeHtml(getModelLabel(currentModel))}</code>`,
+      { parse_mode: 'HTML' }
+    );
   }
 
   const conversationId = getConversation(active.name);
@@ -279,8 +387,9 @@ bot.command(['stato', 'status'], (ctx) => {
     `📁 <b>Nome:</b> <code>${active.name}</code>\n` +
     `📍 <b>Percorso:</b> <code>${active.path}</code>\n` +
     `📂 <b>Esiste sul disco:</b> ${active.exists ? 'Sì 🟢' : 'No 🔴'}\n` +
+    `🤖 <b>Modello AI:</b> <code>${escapeHtml(getModelLabel(currentModel))}</code>\n` +
     `💬 <b>ID Conversazione attiva:</b> ${conversationId ? `<code>${conversationId}</code>` : '<i>Nessuna (il prossimo prompt avvierà una nuova conversazione)</i>'}\n\n` +
-    `<i>Usa /nuova per resettare la sessione o /progetti per cambiare progetto.</i>`,
+    `<i>Usa /model per cambiare modello, /nuova per resettare la sessione o /progetti per cambiare progetto.</i>`,
     { parse_mode: 'HTML' }
   );
 });
@@ -417,6 +526,8 @@ bot.on('text', async (ctx) => {
   }
 
   const conversationId = getConversation(active.name);
+  const selectedModel = getSelectedModel(chatId);
+  const modelLabel = getModelLabel(selectedModel);
 
   await saveLog({
     level: 'INFO',
@@ -424,12 +535,14 @@ bot.on('text', async (ctx) => {
     chatId,
     projectName: active.name,
     conversationId,
-    message: text
+    message: text,
+    payload: { model: selectedModel || 'default' }
   });
 
   const statusMsg = await ctx.reply(
     `🚀 <b>Esecuzione avviata per:</b> <code>${active.name}</code>\n` +
-    `💬 <i>"${text}"</i>\n\n` +
+    `🤖 <b>Modello:</b> <code>${escapeHtml(modelLabel)}</code>\n` +
+    `💬 <i>"${escapeHtml(text)}"</i>\n\n` +
     `⏳ <i>Agente Antigravity al lavoro...</i>`,
     { parse_mode: 'HTML' }
   );
@@ -440,6 +553,7 @@ bot.on('text', async (ctx) => {
       cwd: active.path,
       conversationId,
       chatId,
+      model: selectedModel,
       onOutput: (output) => {
         // Output streaming o logs opzionali
       }
